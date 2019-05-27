@@ -8,19 +8,26 @@ using QuickLogger.NetStandard.Abstractions;
 
 namespace QuickLogger.Tests.Unit
 {    
-    [TestFixture(Category = "Integration")]    
+    [TestFixture(Category = "Unit")]    
     public class QuickLogger_Configuration_Should
     {
-        static string _configPath = String.Empty;
-        static string _configName = "config.json";
-        static string _environmentName = "Test Env";
-        static string _testprovidername = "A dirty File provider";
-        static string _testprovidertype = "FileProvider";
-        static Dictionary<string, object> _testproviderinfo = 
+        private static string _configPath = String.Empty;
+        private static string _configName = "config.json";
+        private static string _testprovidername = "A dirty File provider";
+        private static string _testprovidertype = "FileProvider";
+        private static Dictionary<string, object> _testproviderinfo = 
         new Dictionary<string, object>() {
             { "LogLevel", "LOG_DEBUG" }, { "Filename", ".\\test.log" }, { "DailyRotate", false }, { "ShowTimeStamp", true }
         };
-
+        private string _lastcriticalerror;
+        private string _lasterror;
+        private void LoggerCallbackHandler(ILoggerProvider loggerProvider)
+        {
+            loggerProvider.CriticalError += (x =>
+                _lastcriticalerror = x);
+            loggerProvider.Error += (x =>
+                _lasterror = x);
+        }
         public ILoggerProvider GetaTestProvider(string providername)
         {
             ILoggerProviderProps providerProps = new QuickLoggerProviderProps(_testprovidername, _testprovidertype);
@@ -29,11 +36,18 @@ namespace QuickLogger.Tests.Unit
             return provider;
         }
 
-        public ILoggerConfigManager GetaTestConfigManager(string configpath)
+        public ILoggerConfigManager GetaTestFileConfigManager(string configpath)
         {
             ILoggerConfigManager configmanager = new QuickLoggerFileConfigManager(configpath);
             return configmanager;
         }
+        public ILoggerConfigManager GetTestStringConfigManager()
+        {
+            var conf = "{  \"environment\": \"Test\",  \"providers\": [    {      \"providerProps\": {        \"providerName\": \"A dirty File provider\",        \"providerType\": \"RedisProvider\",        \"providerInfo\": {          \"AppName\": \"QuickLogger Redis Integration Tests\",          \"LogLevel\": \"[etHeader,etInfo,etSuccess,etWarning,etError,etCritical,etException,etDebug,etTrace,etDone,etCustom1,etCustom2]\",          \"Host\": \"*host*\",          \"Port\": 6379,          \"Password\": \"\",	            \"LogKey\": \"a redis key\",          \"MaxSize\": 1000,                    \"MaxFailsToRestart\": 2,          \"MaxFailsToStop\": 0,         	        \"OutputAsJson\": true,	        \"Enable\": true        }      }    }  ]}";
+            ILoggerConfigManager configmanager = new QuickLoggerStringConfigManager(conf);
+            return configmanager;
+        }
+
         [OneTimeSetUp]
         public void SetUp()
         {
@@ -50,38 +64,36 @@ namespace QuickLogger.Tests.Unit
         [Test]
         public void Add_Logger_provider_into_a_new_configuration_manager()
         {
-            ILoggerConfigManager configmanager = GetaTestConfigManager(_configPath);
-            ILoggerSettings settings = configmanager.Load();
-            settings.setEnvironment(_environmentName);
-            settings.addProvider(GetaTestProvider(_testprovidername));
-            Assert.That(settings.getProvider(_testprovidername), !Is.Null);
+            ILoggerConfigManager configmanager = GetaTestFileConfigManager(_configPath);
+            configmanager.GetSettings().addProvider(GetaTestProvider(_testprovidername));
+            Assert.That(configmanager.GetSettings().getProvider(_testprovidername), !Is.Null);
         }
         [Test]
         public void Make_default_settings_and_save_to_disk()
         {
-            ILoggerConfigManager configmanager = GetaTestConfigManager(_configPath);
-            ILoggerSettings settings = configmanager.Load();
-            settings.setEnvironment(_environmentName);
-            settings.addProvider(GetaTestProvider(_testprovidername));
+            ILoggerConfigManager configmanager = GetaTestFileConfigManager(_configPath);
             configmanager.Write();
             Assert.That(File.Exists(_configPath), Is.True);
         }
-
         [Test]
         public void Create_Save_And_Load_logger_configuration_from_disk()
         {
-            ILoggerConfigManager configmanager = GetaTestConfigManager(_configPath);
-            ILoggerSettings settings = configmanager.Load();
-            settings.setEnvironment(_environmentName);
-            settings.addProvider(GetaTestProvider(_testprovidername));
+            ILoggerConfigManager configmanager = GetaTestFileConfigManager(_configPath);
+            configmanager.GetSettings().addProvider(GetaTestProvider(_testprovidername));
             configmanager.Write();
             Assert.That(File.Exists(_configPath), Is.True);
-            Assert.That(configmanager.Reset(), Is.Null);
-            settings = configmanager.Load();
-            Assert.That(settings, !Is.Null);
-            Assert.That(settings.getProvider(_testprovidername), !Is.Null);
+            configmanager.Load();
+            Assert.That(configmanager.GetSettings(), !Is.Null);
+            Assert.That(configmanager.GetSettings().getProvider(_testprovidername), !Is.Null);
         }
-
+        [Test]
+        public void Create_logger_configuration_from_string()
+        {
+            ILoggerConfigManager configmanager = GetTestStringConfigManager();
+            configmanager.Load();
+            Assert.That(configmanager.GetSettings(), !Is.Null);
+            Assert.That(configmanager.GetSettings().getProvider(_testprovidername), !Is.Null);
+        }
         [TearDown]
         public void TearDown()
         {

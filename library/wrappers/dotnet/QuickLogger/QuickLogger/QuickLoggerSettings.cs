@@ -8,26 +8,15 @@ namespace QuickLogger.NetStandard
 {
     public class QuickLoggerSettings : ILoggerSettings  
     {
-        private string _environment { get; set; }
-        public string environment { get { return _environment; } set { _environment = value; } }
+        private bool _handleUncatchedExceptions { get; set; }
+        public bool handleUncatchedExceptions { get { return _handleUncatchedExceptions; } set { _handleUncatchedExceptions = value; } }
         public List<ILoggerProvider> providers { get; set; }
 
         public QuickLoggerSettings() => providers = new List<ILoggerProvider>();
-               
-        public string getEnvironment()
-        {
-            return _environment;
-        }
-
+              
         public List<ILoggerProvider> Providers()
         {
             return providers;
-        }
-
-        public void setEnvironment(string environment)
-        {
-            if (String.IsNullOrEmpty(environment)) { throw new Exception("Invalid environment name"); }
-            _environment = environment;
         }
 
         public void addProvider(ILoggerProvider provider)

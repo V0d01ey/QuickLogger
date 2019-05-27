@@ -1,13 +1,13 @@
-{ ***************************************************************************
+ï»¿{ ***************************************************************************
 
-  Copyright (c) 2016-2018 Kike Pérez
+  Copyright (c) 2016-2019 Kike Pï¿½rez
 
   Unit        : Quick.Logger
   Description : Threadsafe Multi Log File, Console, Email, etc...
-  Author      : Kike Pérez
-  Version     : 1.30
+  Author      : Kike Pï¿½rez
+  Version     : 1.38
   Created     : 12/10/2017
-  Modified    : 17/09/2018
+  Modified    : 09/04/2019
 
   This file is part of QuickLogger: https://github.com/exilon/QuickLogger
 
@@ -42,17 +42,18 @@ interface
 uses
   {$IFDEF MSWINDOWS}
   Windows,
-    {$IFDEF DELPHIXE8_UP}
-    Quick.Json.Serializer,
-    {$ENDIF}
+    //{$IFDEF DELPHIXE8_UP}
+    //Quick.Json.Serializer,
+    //{$ENDIF}
     {$IFDEF DELPHIXE7_UP}
     {$ELSE}
     SyncObjs,
     {$ENDIF}
   {$ENDIF}
-  {$IF Defined(DELPHITOKYO_UP) AND Defined(LINUX)}
+  Quick.JSON.Utils,
+  //{$IF Defined(DELPHITOKYO_UP) AND Defined(LINUX)}
   Quick.Json.Serializer,
-  {$ENDIF}
+  //{$ENDIF}
   Classes,
   Types,
   SysUtils,
@@ -68,7 +69,7 @@ uses
   {$ELSE}
   System.IOUtils,
   System.Generics.Collections,
-    System.JSON,
+  System.JSON,
     {$IFNDEF DELPHIXE8_UP}
     Data.DBXJSON,
     {$ENDIF}
@@ -78,7 +79,7 @@ uses
   Quick.SysInfo;
 
 const
-  QLVERSION = '1.28';
+  QLVERSION = '1.34';
 
 type
 
@@ -91,6 +92,8 @@ type
   {$ENDIF}
 
   ELogger = class(Exception);
+  ELoggerLoadProviderError = class(Exception);
+  ELoggerSaveProviderError = class(Exception);
 
 const
   LOG_ONLYERRORS = [etHeader,etInfo,etError,etCritical,etException];
@@ -117,14 +120,16 @@ type
   TLogProviderStatus = (psNone, psStopped, psInitializing, psRunning, psDraining, psStopping, psRestarting);
 
   {$IFNDEF FPC}
-    {$IF Defined(ANDROID) OR Defined(LINUX)}
+    {$IF Defined(NEXTGEN) OR Defined(OSX) OR Defined(LINUX)}
     TSystemTime = TDateTime;
     {$ENDIF}
   {$ENDIF}
 
-  TLogInfoField = (iiAppName, iiHost, iiUserName, iiEnvironment, iiPlatform, iiOSVersion);
+  TLogInfoField = (iiAppName, iiHost, iiUserName, iiEnvironment, iiPlatform, iiOSVersion, iiExceptionInfo, iiExceptionStackTrace);
 
   TIncludedLogInfo = set of TLogInfoField;
+
+  TProviderErrorEvent = procedure(const aProviderName, aError : string) of object;
 
   TLogItem = class
   private
@@ -137,7 +142,17 @@ type
     property Msg : string read fMsg write fMsg;
     property EventDate : TDateTime read fEventDate write fEventDate;
     function EventTypeName : string;
-    function Clone : TLogItem;
+    function Clone : TLogItem; virtual;
+  end;
+
+  TLogExceptionItem = class(TLogItem)
+  private
+    fException : string;
+    fStackTrace : string;
+  public
+    property Exception : string read fException write fException;
+    property StackTrace : string read fStackTrace write fStackTrace;
+    function Clone : TLogItem; override;
   end;
 
   TLogQueue = class(TThreadedQueueList<TLogItem>);
@@ -160,11 +175,12 @@ type
     function IsEnabled : Boolean;
     function GetVersion : string;
     function GetName : string;
-    {$IFDEF DELPHIXE8_UP}
-    {$IFNDEF ANDROID}
-    function ToJson : string;
+    function GetQueuedLogItems : Integer;
+    {$IF DEFINED(DELPHIXE8_UP) AND NOT DEFINED(NEXTGEN)}
+    function ToJson(aIndent : Boolean = True) : string;
     procedure FromJson(const aJson : string);
-    {$ENDIF}
+    procedure SaveToFile(const aJsonFile : string);
+    procedure LoadFromFile(const aJsonFile : string);
     {$ENDIF}
   end;
 
@@ -222,6 +238,15 @@ type
   TStatusChangedEvent = reference to procedure(aProviderName : string; status : TLogProviderStatus);
   {$ENDIF}
 
+  TJsonOutputOptions = class
+  private
+    fUseUTCTime : Boolean;
+    fTimeStampName : string;
+  public
+    property UseUTCTime : Boolean read fUseUTCTime write fUseUTCTime;
+    property TimeStampName : string read fTimeStampName write fTimeStampName;
+  end;
+
   TLogProviderBase = class(TInterfacedObject,ILogProvider)
   protected
     fThreadLog : TThreadLog;
@@ -233,6 +258,8 @@ type
     fEnabled : Boolean;
     fTimePrecission : Boolean;
     fFails : Integer;
+    fRestartTimes : Integer;
+    fFailsToRestart : Integer;
     fMaxFailsToRestart : Integer;
     fMaxFailsToStop : Integer;
     fUsesQueue : Boolean;
@@ -251,6 +278,7 @@ type
     fIncludedInfo : TIncludedLogInfo;
     fSystemInfo : TSystemInfo;
     fCustomMsgOutput : Boolean;
+    fOnNotifyError : TProviderErrorEvent;
     procedure SetTimePrecission(Value : Boolean);
     procedure SetEnabled(aValue : Boolean);
     function GetQueuedLogItems : Integer;
@@ -258,7 +286,9 @@ type
     function GetEventTypeName(cEventType : TEventType) : string;
     procedure SetEventTypeName(cEventType: TEventType; const cValue : string);
     function IsSendLimitReached(cEventType : TEventType): Boolean;
+    procedure SetMaxFailsToRestart(const Value: Integer);
   protected
+    fJsonOutputOptions : TJsonOutputOptions;
     function LogItemToJsonObject(cLogItem: TLogItem): TJSONObject; overload;
     function LogItemToJson(cLogItem : TLogItem) : string; overload;
     function LogItemToHtml(cLogItem: TLogItem): string;
@@ -267,12 +297,13 @@ type
     procedure SetStatus(cStatus : TLogProviderStatus);
     function GetLogLevel : TLogLevel;
     property SystemInfo : TSystemInfo read fSystemInfo;
+    procedure NotifyError(const aError : string);
   public
     constructor Create; virtual;
     destructor Destroy; override;
     procedure Init; virtual;
     procedure Restart; virtual; abstract;
-    procedure Stop;
+    procedure Stop; virtual;
     procedure Drain;
     procedure WriteLog(cLogItem : TLogItem); virtual; abstract;
     function IsQueueable : Boolean;
@@ -283,7 +314,7 @@ type
     property TimePrecission : Boolean read fTimePrecission write SetTimePrecission;
     {$IFDEF DELPHIXE7_UP}[TNotSerializableProperty]{$ENDIF}
     property Fails : Integer read fFails write fFails;
-    property MaxFailsToRestart : Integer read fMaxFailsToRestart write fMaxFailsToRestart;
+    property MaxFailsToRestart : Integer read fMaxFailsToRestart write SetMaxFailsToRestart;
     property MaxFailsToStop : Integer read fMaxFailsToStop write fMaxFailsToStop;
     property CustomMsgOutput : Boolean read fCustomMsgOutput write fCustomMsgOutput;
     property OnFailToLog : TFailToLogEvent read fOnFailToLog write fOnFailToLog;
@@ -308,15 +339,25 @@ type
     function GetVersion : string;
     function IsEnabled : Boolean;
     function GetName : string;
-    {$IFDEF DELPHIXE8_UP}
-    {$IFNDEF ANDROID}
-    function ToJson : string;
+    {$IF DEFINED(DELPHIXE8_UP) AND NOT DEFINED(NEXTGEN)}
+    function ToJson(aIndent : Boolean = True) : string;
     procedure FromJson(const aJson : string);
-    {$ENDIF}
+    procedure SaveToFile(const aJsonFile : string);
+    procedure LoadFromFile(const aJsonFile : string);
     {$ENDIF}
   end;
 
+  {$IF DEFINED(DELPHIXE8_UP) AND NOT DEFINED(NEXTGEN)}
+  TLogProviderList = class(TList<ILogProvider>)
+  public
+    function ToJson(aIndent : Boolean = True) : string;
+    procedure FromJson(const aJson : string);
+    procedure LoadFromFile(const aJsonFile : string);
+    procedure SaveToFile(const aJsonFile : string);
+  end;
+  {$ELSE}
   TLogProviderList = TList<ILogProvider>;
+  {$ENDIF}
 
   TThreadProviderLog = class(TThread)
   private
@@ -337,18 +378,53 @@ type
     fProviders : TLogProviderList;
     fWaitForFlushBeforeExit : Integer;
     fOnQueueError: TQueueErrorEvent;
+    fOwnErrorsProvider : TLogProviderBase;
+    fOnProviderError : TProviderErrorEvent;
     function GetQueuedLogItems : Integer;
-    procedure EnQueueItem(cEventDate : TSystemTime; const cMsg : string; cEventType : TEventType);
-    procedure HandleException(E : Exception);
+    procedure EnQueueItem(cEventDate : TSystemTime; const cMsg : string; cEventType : TEventType); overload;
+    procedure EnQueueItem(cEventDate : TSystemTime; const cMsg : string; const cException, cStackTrace : string; cEventType : TEventType); overload;
+    procedure EnQueueItem(cLogItem : TLogItem); overload;
+    procedure OnGetHandledException(E : Exception);
+    procedure OnGetRuntimeError(const ErrorName : string; ErrorCode : Byte; ErrorPtr : Pointer);
+    procedure OnGetUnhandledException(ExceptObject: TObject; ExceptAddr: Pointer);
+    procedure NotifyProviderError(const aProviderName, aError : string);
+    procedure SetOwnErrorsProvider(const Value: TLogProviderBase);
   public
     constructor Create;
     destructor Destroy; override;
     property Providers : TLogProviderList read fProviders write fProviders;
+    property RedirectOwnErrorsToProvider : TLogProviderBase read fOwnErrorsProvider write SetOwnErrorsProvider;
     property WaitForFlushBeforeExit : Integer read fWaitForFlushBeforeExit write fWaitForFlushBeforeExit;
+    property OnProviderError : TProviderErrorEvent read fOnProviderError write fOnProviderError;
     property QueueCount : Integer read GetQueuedLogItems;
     property OnQueueError : TQueueErrorEvent read fOnQueueError write fOnQueueError;
+    function ProvidersQueueCount : Integer;
+    function IsQueueEmpty : Boolean;
+    class function GetVersion : string;
     procedure Add(const cMsg : string; cEventType : TEventType); overload;
+    procedure Add(const cMsg, cException, cStackTrace : string; cEventType : TEventType); overload;
     procedure Add(const cMsg : string; cValues : array of {$IFDEF FPC}const{$ELSE}TVarRec{$ENDIF}; cEventType : TEventType); overload;
+    //simplify logging add
+    procedure Info(const cMsg : string); overload;
+    procedure Info(const cMsg : string; cValues : array of const); overload;
+    procedure Warn(const cMsg : string); overload;
+    procedure Warn(const cMsg : string; cValues : array of const); overload;
+    procedure Error(const cMsg : string); overload;
+    procedure Error(const cMsg : string; cValues : array of const); overload;
+    procedure Critical(const cMsg : string); overload;
+    procedure Critical(const cMsg : string; cValues : array of const); overload;
+    procedure Succ(const cMsg : string); overload;
+    procedure Succ(const cMsg : string; cValues : array of const); overload;
+    procedure Done(const cMsg : string); overload;
+    procedure Done(const cMsg : string; cValues : array of const); overload;
+    procedure Debug(const cMsg : string); overload;
+    procedure Debug(const cMsg : string; cValues : array of const); overload;
+    procedure Trace(const cMsg : string); overload;
+    procedure Trace(const cMsg : string; cValues : array of const); overload;
+    procedure &Except(const cMsg : string); overload;
+    procedure &Except(const cMsg : string; cValues : array of const); overload;
+    procedure &Except(const cMsg, cException, cStackTrace : string); overload;
+    procedure &Except(const cMsg : string; cValues: array of const; const cException, cStackTrace: string); overload;
   end;
 
   procedure Log(const cMsg : string; cEventType : TEventType); overload;
@@ -356,7 +432,9 @@ type
 
 var
   Logger : TLogger;
-  GlobalLoggerHandleException : procedure(E : Exception) of object;
+  GlobalLoggerHandledException : procedure(E : Exception) of object;
+  GlobalLoggerRuntimeError : procedure(const ErrorName : string; ErrorCode : Byte; ErrorPtr : Pointer) of object;
+  GlobalLoggerUnhandledException : procedure(ExceptObject: TObject; ExceptAddr: Pointer) of object;
 
 implementation
 
@@ -393,8 +471,10 @@ begin
   fTimePrecission := False;
   fSendLimits := TLogSendLimit.Create;
   fFails := 0;
+  fRestartTimes := 0;
   fMaxFailsToRestart := 2;
-  fMaxFailsToStop := 10;
+  fMaxFailsToStop := 0;
+  fFailsToRestart := fMaxFailsToRestart - 1;
   fEnabled := False;
   fUsesQueue := True;
   fEventTypeNames := DEF_EVENTTYPENAMES;
@@ -403,6 +483,9 @@ begin
   fPlatformInfo := '';
   fIncludedInfo := [iiAppName,iiHost];
   fSystemInfo := Quick.SysInfo.SystemInfo;
+  fJsonOutputOptions := TJsonOutputOptions.Create;
+  fJsonOutputOptions.UseUTCTime := False;
+  fJsonOutputOptions.TimeStampName := 'timestamp';
   fAppName := fSystemInfo.AppName;
 end;
 
@@ -413,7 +496,7 @@ begin
   {$ENDIF}
   if Assigned(fLogQueue) then fLogQueue.Free;
   if Assigned(fSendLimits) then fSendLimits.Free;
-
+  if Assigned(fJsonOutputOptions) then fJsonOutputOptions.Free;
   inherited;
 end;
 
@@ -428,6 +511,7 @@ begin
     Sleep(0);
   end;
   SetStatus(TLogProviderStatus.psStopped);
+  //NotifyError(Format('Provider stopped!',[fMaxFailsToStop]));
 end;
 
 procedure TLogProviderBase.IncAndCheckErrors;
@@ -442,17 +526,37 @@ begin
     Writeln(Format('drain: %s (%d)',[Self.ClassName,fFails]));
     {$ENDIF}
     Drain;
+    NotifyError(Format('Max fails (%d) to Stop reached! It will be Drained & Stopped now!',[fMaxFailsToStop]));
     if Assigned(fOnCriticalError) then fOnCriticalError(fName,'Max fails to Stop reached!');
   end
-  else if fFails > fMaxFailsToRestart then
+  else if fFailsToRestart = 0 then
   begin
     //try to restart provider
     {$IFDEF LOGGER_DEBUG}
     Writeln(Format('restart: %s (%d)',[Self.ClassName,fFails]));
     {$ENDIF}
-    Restart;
+    NotifyError(Format('Max fails (%d) to Restart reached! Restarting...',[fMaxFailsToRestart]));
     SetStatus(TLogProviderStatus.psRestarting);
+    try
+      Restart;
+    except
+      on E : Exception do
+      begin
+        NotifyError(Format('Failed to restart: %s',[e.Message]));
+        //set as running to try again
+        SetStatus(TLogProviderStatus.psRunning);
+        Exit;
+      end;
+    end;
+    Inc(fRestartTimes);
+    NotifyError(Format('Provider Restarted. This occurs for %d time(s)',[fRestartTimes]));
+    fFailsToRestart := fMaxFailsToRestart-1;
     if Assigned(fOnRestart) then fOnRestart(fName);
+  end
+  else
+  begin
+    Dec(fFailsToRestart);
+    NotifyError(Format('Failed %d time(s). Fails to restart %d/%d',[fFails,fFailsToRestart,fMaxFailsToRestart]));
   end;
 end;
 
@@ -480,18 +584,23 @@ end;
 
 procedure TLogProviderBase.Init;
 begin
-  if not(fStatus in [psNone,psStopped]) then Exit;
+  if not(fStatus in [psNone,psStopped,psRestarting]) then Exit;
   {$IFDEF LOGGER_DEBUG}
   Writeln(Format('init thread: %s',[Self.ClassName]));
   {$ENDIF}
   SetStatus(TLogProviderStatus.psInitializing);
   if fUsesQueue then
   begin
-    fThreadLog := TThreadLog.Create;
-    fThreadLog.LogQueue := fLogQueue;
-    fThreadLog.Provider := Self;
-    fThreadLog.Start;
+    if not Assigned(fThreadLog) then
+    begin
+      fThreadLog := TThreadLog.Create;
+      fThreadLog.LogQueue := fLogQueue;
+      fThreadLog.Provider := Self;
+      fThreadLog.Start;
+    end;
   end;
+  SetStatus(TLogProviderStatus.psRunning);
+  fEnabled := True;
 end;
 
 function TLogProviderBase.IsQueueable: Boolean;
@@ -508,7 +617,8 @@ end;
 function TLogProviderBase.LogItemToJsonObject(cLogItem: TLogItem): TJSONObject;
 begin
   Result := TJSONObject.Create;
-  Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('timestamp', DateTimeToGMT(cLogItem.EventDate));
+  if fJsonOutputOptions.UseUTCTime then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}(fJsonOutputOptions.TimeStampName,DateTimeToJsonDate(LocalTimeToUTC(cLogItem.EventDate)))
+    else Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}(fJsonOutputOptions.TimeStampName,DateTimeToJsonDate(cLogItem.EventDate));
   Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('type',EventTypeName[cLogItem.EventType]);
   if iiHost in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('host',SystemInfo.HostName);
   if iiAppName in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('application',fAppName);
@@ -516,6 +626,11 @@ begin
   if iiPlatform in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('platform',fPlatformInfo);
   if iiOSVersion in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('OS',SystemInfo.OSVersion);
   if iiUserName in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('user',SystemInfo.UserName);
+  if cLogItem is TLogExceptionItem then
+  begin
+    if iiExceptionInfo in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('exception',TLogExceptionItem(cLogItem).Exception);
+    if iiExceptionStackTrace in fIncludedInfo then Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('stacktrace',TLogExceptionItem(cLogItem).StackTrace);
+  end;
   Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('message',cLogItem.Msg);
   Result.{$IFDEF FPC}Add{$ELSE}AddPair{$ENDIF}('level',Integer(cLogItem.EventType).ToString);
 end;
@@ -546,6 +661,7 @@ var
 begin
   msg := TStringList.Create;
   try
+    msg.Add('<html><body>');
     msg.Add(Format('<B>EventDate:</B> %s%s',[DateTimeToStr(cLogItem.EventDate,FormatSettings),HTMBR]));
     msg.Add(Format('<B>Type:</B> %s%s',[EventTypeName[cLogItem.EventType],HTMBR]));
     if iiAppName in IncludedInfo then msg.Add(Format('<B>Application:</B> %s%s',[SystemInfo.AppName,HTMBR]));
@@ -555,6 +671,7 @@ begin
     if iiEnvironment in IncludedInfo then msg.Add(Format('<B>Environment:</B> %s%s',[Environment,HTMBR]));
     if iiPlatform in IncludedInfo then msg.Add(Format('<B>Platform:</B> %s%s',[PlatformInfo,HTMBR]));
     msg.Add(Format('<B>Message:</B> %s%s',[cLogItem.Msg,HTMBR]));
+    msg.Add('</body></html>');
     Result := msg.Text;
   finally
     msg.Free;
@@ -582,6 +699,11 @@ begin
   end;
 end;
 
+procedure TLogProviderBase.NotifyError(const aError: string);
+begin
+  if Assigned(fOnNotifyError) then fOnNotifyError(fName,aError);
+end;
+
 procedure TLogProviderBase.Stop;
 begin
   if (fStatus = psStopped) or (fStatus = psStopping) then Exit;
@@ -589,12 +711,17 @@ begin
   {$IFDEF LOGGER_DEBUG}
   Writeln(Format('stopping thread: %s',[Self.ClassName]));
   {$ENDIF}
+  fEnabled := False;
   SetStatus(TLogProviderStatus.psStopping);
   if Assigned(fThreadLog) then
   begin
-    fThreadLog.Terminate;
-    fThreadLog.WaitFor;
+    if not fThreadLog.Terminated then
+    begin
+      fThreadLog.Terminate;
+      fThreadLog.WaitFor;
+    end;
     fThreadLog.Free;
+    fThreadLog := nil;
   end;
   SetStatus(TLogProviderStatus.psStopped);
   {$IFDEF LOGGER_DEBUG}
@@ -602,15 +729,14 @@ begin
   {$ENDIF}
 end;
 
-{$IFDEF DELPHIXE8_UP}
-  {$IFNDEF ANDROID}
-  function TLogProviderBase.ToJson: string;
+{$IF DEFINED(DELPHIXE8_UP) AND NOT DEFINED(NEXTGEN)}
+  function TLogProviderBase.ToJson(aIndent : Boolean = True) : string;
   var
     serializer : TJsonSerializer;
   begin
     serializer := TJsonSerializer.Create(slPublicProperty);
     try
-      Result := serializer.ObjectToJson(Self);
+      Result := serializer.ObjectToJson(Self,aIndent);
     finally
       serializer.Free;
     end;
@@ -623,11 +749,37 @@ end;
     serializer := TJsonSerializer.Create(slPublicProperty);
     try
       Self := TLogProviderBase(serializer.JsonToObject(Self,aJson));
+      if fEnabled then Self.Restart;
     finally
       serializer.Free;
     end;
   end;
-  {$ENDIF}
+
+  procedure TLogProviderBase.SaveToFile(const aJsonFile : string);
+  var
+    json : TStringList;
+  begin
+    json := TStringList.Create;
+    try
+      json.Text := Self.ToJson;
+      json.SaveToFile(aJsonFile);
+    finally
+      json.Free;
+    end;
+  end;
+
+  procedure TLogProviderBase.LoadFromFile(const aJsonFile : string);
+  var
+    json : TStringList;
+  begin
+    json := TStringList.Create;
+    try
+      json.LoadFromFile(aJsonFile);
+      Self.FromJson(json.Text);
+    finally
+      json.Free;
+    end;
+  end;
 {$ENDIF}
 
 procedure TLogProviderBase.EnQueueItem(cLogItem : TLogItem);
@@ -657,6 +809,13 @@ begin
   fEventTypeNames[Integer(cEventType)] := cValue;
 end;
 
+procedure TLogProviderBase.SetMaxFailsToRestart(const Value: Integer);
+begin
+  if Value > 0 then fMaxFailsToRestart := Value
+    else fMaxFailsToRestart := 1;
+  fFailsToRestart := fMaxFailsToRestart-1;
+end;
+
 function TLogProviderBase.GetQueuedLogItems: Integer;
 begin
   Result := fLogQueue.QueueSize;
@@ -671,7 +830,6 @@ procedure TLogProviderBase.SetEnabled(aValue: Boolean);
 begin
   if (aValue <> fEnabled) then
   begin
-    fEnabled := aValue;
     if aValue then Init
       else Stop;
   end;
@@ -746,11 +904,15 @@ begin
               if not fProvider.IsSendLimitReached(logitem.EventType) then fProvider.WriteLog(logitem);
             end;
           except
-            {$IFDEF LOGGER_DEBUG}
-            Writeln(Format('fail: %s (%d)',[TLogProviderBase(fProvider).ClassName,TLogProviderBase(fProvider).Fails + 1]));
-            {$ENDIF}
-            //check if there are many errors and needs to restart or stop provider
-            if not Terminated then fProvider.IncAndCheckErrors;
+            on E : Exception do
+            begin
+              {$IFDEF LOGGER_DEBUG}
+              Writeln(Format('fail: %s (%d)',[TLogProviderBase(fProvider).ClassName,TLogProviderBase(fProvider).Fails + 1]));
+              {$ENDIF}
+              TLogProviderBase(fProvider).NotifyError(e.message);
+              //check if there are many errors and needs to restart or stop provider
+              if not Terminated then fProvider.IncAndCheckErrors;
+            end;
           end;
         finally
           logitem.Free;
@@ -825,11 +987,15 @@ begin
                   try
                     provider.WriteLog(logitem);
                   except
-                    {$IFDEF LOGGER_DEBUG}
-                    Writeln(Format('fail: %s (%d)',[TLogProviderBase(provider).ClassName,TLogProviderBase(provider).Fails + 1]));
-                    {$ENDIF}
-                    //try to restart provider
-                    if not Terminated then provider.IncAndCheckErrors;
+                    on E : Exception do
+                    begin
+                      {$IFDEF LOGGER_DEBUG}
+                      Writeln(Format('fail: %s (%d)',[TLogProviderBase(provider).ClassName,TLogProviderBase(provider).Fails + 1]));
+                      {$ENDIF}
+                      TLogProviderBase(provider).NotifyError(e.message);
+                      //try to restart provider
+                      if not Terminated then provider.IncAndCheckErrors;
+                    end;
                   end;
                 end;
               end;
@@ -879,13 +1045,26 @@ begin
   Result.Msg := Self.Msg;
 end;
 
+{  TLogItemException  }
+
+function TLogExceptionItem.Clone : TLogItem;
+begin
+  Result := TLogExceptionItem.Create;
+  Result.EventType := Self.EventType;
+  Result.EventDate := Self.EventDate;
+  Result.Msg := Self.Msg;
+  TLogExceptionItem(Result).Exception := Self.Exception;
+end;
+
 
 { TLogger }
 
 constructor TLogger.Create;
 begin
   inherited;
-  GlobalLoggerHandleException := HandleException;
+  GlobalLoggerHandledException := OnGetHandledException;
+  GlobalLoggerRuntimeError := OnGetRuntimeError;
+  GlobalLoggerUnhandledException := OnGetUnhandledException;
   fWaitForFlushBeforeExit := DEF_WAIT_FLUSH_LOG;
   fLogQueue := TLogQueue.Create(DEF_QUEUE_SIZE,DEF_QUEUE_PUSH_TIMEOUT,DEF_QUEUE_POP_TIMEOUT);
   fProviders := TLogProviderList.Create;
@@ -899,12 +1078,25 @@ destructor TLogger.Destroy;
 var
   FinishTime : TDateTime;
 begin
-  GlobalLoggerHandleException := nil;
-  //wait for log queue finalization
+  GlobalLoggerHandledException := nil;
+  GlobalLoggerRuntimeError := nil;
+  GlobalLoggerUnhandledException := nil;
   FinishTime := Now();
-  repeat
-    Sleep(0);
-  until (fThreadProviderLog.LogQueue.QueueSize = 0) or (SecondsBetween(Now(),FinishTime) > fWaitForFlushBeforeExit);
+  //wait for main queue and all providers queues finish to flush or max time reached
+  try
+    while (not Self.IsQueueEmpty) and (SecondsBetween(Now(),FinishTime) < fWaitForFlushBeforeExit) do
+    begin
+      {$IFDEF MSWINDOWS}
+      ProcessMessages;
+      {$ELSE}
+      Sleep(250);
+      {$ENDIF}
+    end;
+  except
+    {$IFDEF LOGGER_DEBUG}
+    Writeln(Format('fail waiting for flush: %s',[provider.GetName]));
+    {$ENDIF}
+  end;
   //finalize queue thread
   fThreadProviderLog.Terminate;
   fThreadProviderLog.WaitFor;
@@ -920,6 +1112,16 @@ begin
   Result := fLogQueue.QueueSize;
 end;
 
+class function TLogger.GetVersion: string;
+begin
+  Result := QLVERSION;
+end;
+
+function TLogger.IsQueueEmpty: Boolean;
+begin
+  Result := (QueueCount = 0) and (ProvidersQueueCount = 0);
+end;
+
 procedure TLogger.Add(const cMsg : string; cEventType : TEventType);
 var
   SystemTime : TSystemTime;
@@ -930,6 +1132,18 @@ begin
   GetLocalTime(SystemTime);
   {$ENDIF}
   Self.EnQueueItem(SystemTime,cMsg,cEventType);
+end;
+
+procedure TLogger.Add(const cMsg, cException, cStackTrace : string; cEventType : TEventType);
+var
+  SystemTime : TSystemTime;
+begin
+  {$IFDEF FPCLINUX}
+  DateTimeToSystemTime(Now(),SystemTime);
+  {$ELSE}
+  GetLocalTime(SystemTime);
+  {$ENDIF}
+  Self.EnQueueItem(SystemTime,cMsg,cException,cStackTrace,cEventType);
 end;
 
 procedure TLogger.Add(const cMsg : string; cValues : array of {$IFDEF FPC}const{$ELSE}TVarRec{$ENDIF}; cEventType : TEventType);
@@ -951,15 +1165,36 @@ begin
   logitem := TLogItem.Create;
   logitem.EventType := cEventType;
   logitem.Msg := cMsg;
-  {$IF DEFINED(ANDROID) OR DEFINED(DELPHILINUX)}
+  {$IF DEFINED(NEXTGEN) OR DEFINED(OSX) OR DEFINED(DELPHILINUX)}
   logitem.EventDate := cEventDate;
   {$ELSE}
   logitem.EventDate := SystemTimeToDateTime(cEventDate);
   {$ENDIF}
+  Self.EnQueueItem(logitem);
+end;
 
-  if fLogQueue.PushItem(logitem) <> TWaitResult.wrSignaled then
+procedure TLogger.EnQueueItem(cEventDate : TSystemTime; const cMsg : string; const cException, cStackTrace : string; cEventType : TEventType);
+var
+  logitem : TLogExceptionItem;
+begin
+  logitem := TLogExceptionItem.Create;
+  logitem.EventType := cEventType;
+  logitem.Msg := cMsg;
+  logitem.Exception := cException;
+  logitem.StackTrace := cStackTrace;
+  {$IF DEFINED(NEXTGEN) OR DEFINED(OSX) OR DEFINED(DELPHILINUX)}
+  logitem.EventDate := cEventDate;
+  {$ELSE}
+  logitem.EventDate := SystemTimeToDateTime(cEventDate);
+  {$ENDIF}
+  Self.EnQueueItem(logitem);
+end;
+
+procedure TLogger.EnQueueItem(cLogItem : TLogItem);
+begin
+  if fLogQueue.PushItem(cLogItem) <> TWaitResult.wrSignaled then
   begin
-    FreeAndNil(logitem);
+    FreeAndNil(cLogItem);
     if Assigned(fOnQueueError) then fOnQueueError('Logger insertion timeout!');
     //raise ELogger.Create('Logger insertion timeout!');
     {$IFDEF LOGGER_DEBUG}
@@ -972,7 +1207,107 @@ begin
   {$ENDIF}
 end;
 
-procedure TLogger.HandleException(E : Exception);
+procedure TLogger.Info(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etInfo);
+end;
+
+procedure TLogger.Info(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etInfo);
+end;
+
+procedure TLogger.Critical(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etCritical);
+end;
+
+procedure TLogger.Critical(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etCritical);
+end;
+
+procedure TLogger.Succ(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etSuccess);
+end;
+
+procedure TLogger.Succ(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etSuccess);
+end;
+
+procedure TLogger.Warn(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etWarning);
+end;
+
+procedure TLogger.Warn(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etWarning);
+end;
+
+procedure TLogger.Debug(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etDebug);
+end;
+
+procedure TLogger.Debug(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etDebug);
+end;
+
+procedure TLogger.Trace(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etDebug);
+end;
+
+procedure TLogger.Trace(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etDebug);
+end;
+
+procedure TLogger.Done(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etDone);
+end;
+
+procedure TLogger.Done(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etDone);
+end;
+
+procedure TLogger.Error(const cMsg: string);
+begin
+  Self.Add(cMsg,TEventType.etError);
+end;
+
+procedure TLogger.Error(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etError);
+end;
+
+procedure TLogger.&Except(const cMsg : string);
+begin
+  Self.Add(cMsg,TEventType.etException);
+end;
+
+procedure TLogger.&Except(const cMsg: string; cValues: array of const);
+begin
+  Self.Add(cMsg,cValues,TEventType.etException);
+end;
+
+procedure TLogger.&Except(const cMsg, cException, cStackTrace: string);
+begin
+  Self.Add(cMsg,cException,cStackTrace,TEventType.etException);
+end;
+
+procedure TLogger.&Except(const cMsg : string; cValues: array of const; const cException, cStackTrace: string);
+begin
+  Self.Add(Format(cMsg,cValues),cException,cStackTrace,TEventType.etException);
+end;
+
+procedure TLogger.OnGetHandledException(E : Exception);
 var
   SystemTime : TSystemTime;
 begin
@@ -981,7 +1316,79 @@ begin
   {$ELSE}
   GetLocalTime(SystemTime);
   {$ENDIF}
-  Self.EnQueueItem(SystemTime,Format('(%s) : %s',[E.ClassName,E.Message]),etException);
+  {$IFDEF FPC}
+  Self.EnQueueItem(SystemTime,Format('(%s) : %s',[E.ClassName,E.Message]),E.ClassName,'',etException);
+  {$ELSE}
+  Self.EnQueueItem(SystemTime,Format('(%s) : %s',[E.ClassName,E.Message]),E.ClassName,E.StackTrace,etException);
+  {$ENDIF}
+end;
+
+procedure TLogger.OnGetRuntimeError(const ErrorName : string; ErrorCode : Byte; ErrorPtr : Pointer);
+var
+  SystemTime : TSystemTime;
+begin
+  {$IFDEF FPCLINUX}
+  DateTimeToSystemTime(Now(),SystemTime);
+  {$ELSE}
+  GetLocalTime(SystemTime);
+  {$ENDIF}
+  Self.EnQueueItem(SystemTime,Format('Runtime error %d (%s) risen at $%X',[Errorcode,errorname,Integer(ErrorPtr)]),'RuntimeError','',etException);
+end;
+
+procedure TLogger.OnGetUnhandledException(ExceptObject : TObject; ExceptAddr : Pointer);
+var
+  SystemTime : TSystemTime;
+  cname : string;
+  msg : String;
+begin
+  {$IFDEF FPCLINUX}
+  DateTimeToSystemTime(Now(),SystemTime);
+  {$ELSE}
+  GetLocalTime(SystemTime);
+  {$ENDIF}
+  if ExceptObject is Exception then Self.EnQueueItem(SystemTime,Format('Unhandled Exception (%s) : %s',[Exception(ExceptObject).ClassName,Exception(ExceptObject).Message]),
+                                                     Exception(ExceptObject).ClassName,
+                                                     {$IFDEF FPC}'',{$ELSE}Exception(ExceptObject).StackTrace,{$ENDIF}
+                                                     etException)
+    else Self.EnQueueItem(SystemTime,Format('Unhandled Exception (%s) at $%X',[ExceptObject.ClassName,Integer(ExceptAddr)]),'Exception','',etException);
+end;
+
+function TLogger.ProvidersQueueCount: Integer;
+var
+  provider : ILogProvider;
+begin
+  Result := 0;
+  for provider in fProviders do
+  begin
+    Result := Result + provider.GetQueuedLogItems;
+  end;
+end;
+
+procedure TLogger.NotifyProviderError(const aProviderName, aError: string);
+var
+  logitem : TLogItem;
+begin
+  if Assigned(fOwnErrorsProvider) then
+  begin
+    logitem := TLogItem.Create;
+    logitem.EventType := etError;
+    logitem.EventDate := Now();
+    logitem.Msg := Format('LOGGER "%s": %s',[aProviderName,aError]);
+    fOwnErrorsProvider.EnQueueItem(logitem);
+  end;
+  if Assigned(fOnProviderError) then fOnProviderError(aProviderName,aError);
+end;
+
+procedure TLogger.SetOwnErrorsProvider(const Value: TLogProviderBase);
+var
+  provider : ILogProvider;
+begin
+  fOwnErrorsProvider := Value;
+  for provider in fProviders do
+  begin
+    //redirect provider errors to logger
+    TLogProviderBase(provider).fOnNotifyError := NotifyProviderError;
+  end;
 end;
 
 { TLogSendLimit }
@@ -1040,6 +1447,78 @@ begin
     end;
   end;
 end;
+
+{ TLogProviderList }
+
+{$IF DEFINED(DELPHIXE8_UP) AND NOT DEFINED(NEXTGEN)}
+function TLogProviderList.ToJson(aIndent : Boolean = True) : string;
+var
+  iprovider : ILogProvider;
+begin
+  Result := '{';
+  for iprovider in Self do
+  begin
+    Result := Result + '"' + iprovider.GetName + '": ';
+    Result := Result + iprovider.ToJson(False);
+    Result := Result + ',';
+  end;
+  if Result.EndsWith(',') then Result := RemoveLastChar(Result);
+  Result := Result + '}';
+  if aIndent then Result := TJsonUtils.JsonFormat(Result);
+end;
+
+procedure TLogProviderList.FromJson(const aJson : string);
+var
+  iprovider : ILogProvider;
+  jobject : TJSONObject;
+  jvalue : TJSONValue;
+begin
+  try
+    jobject := TJSONObject.ParseJSONValue(aJson) as TJSONObject;
+    try
+      for iprovider in Self do
+      begin
+        jvalue := jobject.GetValue(iprovider.GetName);
+        iprovider.FromJson(jvalue.ToJSON);
+      end;
+    finally
+      jobject.Free;
+    end;
+  except
+    on E : Exception do
+    begin
+      if iprovider <> nil then raise ELoggerLoadProviderError.CreateFmt('Error loading provider "%s" from json: %s',[iprovider.GetName,e.message])
+        else raise ELoggerLoadProviderError.CreateFmt('Error loading providers from json: %s',[e.message]);
+    end;
+  end;
+end;
+
+procedure TLogProviderList.LoadFromFile(const aJsonFile : string);
+var
+  json : TStringList;
+begin
+  json := TStringList.Create;
+  try
+    json.LoadFromFile(aJsonFile);
+    Self.FromJson(json.Text);
+  finally
+    json.Free;
+  end;
+end;
+
+procedure TLogProviderList.SaveToFile(const aJsonFile : string);
+var
+  json : TStringList;
+begin
+  json := TStringList.Create;
+  try
+    json.Text := Self.ToJson;
+    json.SaveToFile(aJsonFile);
+  finally
+    json.Free;
+  end;
+end;
+{$ENDIF}
 
 initialization
   Logger := TLogger.Create;

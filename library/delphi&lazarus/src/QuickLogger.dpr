@@ -2,14 +2,14 @@
 
 { ***************************************************************************
 
-  Copyright (c) 2016-2018 Kike Pérez
+  Copyright (c) 2016-2019 Kike Pérez
 
   Library     : QuickLogger
-  Description : Dynamic library headers for external languaje wrappers
+  Description : Dynamic library headers for external language wrappers
   Author      : Kike Fuentes (Turric4n)
-  Version     : 1.29
+  Version     : 1.36
   Created     : 15/10/2017
-  Modified    : 14/11/2018
+  Modified    : 26/03/2019
 
   This file is part of QuickLogger: https://github.com/exilon/QuickLogger
 
@@ -30,6 +30,7 @@
  *************************************************************************** }
 
 uses
+  Rtti,
   {$IFNDEF UNIX}
   Windows,
   ActiveX,
@@ -40,6 +41,10 @@ uses
   Quick.Logger,
   {$IFDEF MSWINDOWS}
   Quick.Logger.Provider.ADODB,
+  Quick.Logger.Provider.IDEDebug,
+  Quick.Logger.ExceptionHook,
+  Quick.Logger.RuntimeErrorHook,
+  Quick.Logger.UnhandledExceptionHook,
   Quick.Logger.Provider.EventLog,
   {$ENDIF}
   Quick.Logger.Provider.Console,
@@ -50,6 +55,9 @@ uses
   Quick.Logger.Provider.SysLog,
   Quick.Logger.Provider.Telegram,
   Quick.Logger.Provider.Rest,
+  Quick.Logger.Provider.InfluxDB,
+  Quick.Logger.Provider.ElasticSearch,
+  Quick.Logger.Provider.GrayLog,
   {$IFDEF FPC}
   Generics.Collections,
   jsonparser,
@@ -109,7 +117,8 @@ type
     procedure ToWrapperStatusChanged(aProviderName : string; status: TLogProviderStatus);
     {$ENDIF}
    protected
-    constructor Create(const FriendlyName : string; Provider : ILogProvider);
+    constructor Create(const FriendlyName : string; Provider : TLogProviderBase);
+    destructor Destroy; override;
     procedure TestCallbacks;
     //outside assignements from native library
     property Provider : ILogProvider read fprovider;
@@ -124,11 +133,32 @@ type
   end;
 
 const
-  QUICKLOGPROVIDERS : array [0..9] of string = ('ConsoleProvider', 'FileProvider', 'RedisProvider', 'TelegramProvider', 'SlackProvider', 'RestProvider', 'SysLogProvider', 'AdoProvider', 'WindowsEventLogProvider', 'EmailProvider');
+  QUICKLOGPROVIDERS : array [0..12] of string = ('ConsoleProvider',
+  'FileProvider', 'RedisProvider', 'TelegramProvider', 'SlackProvider', 'RestProvider',
+  'SysLogProvider', 'AdoProvider', 'WindowsEventLogProvider',
+  'EmailProvider', 'InfluxDBProvider', 'ElasticSearchProvider', 'GraylogProvider');
+  PROVIDERSTATUSTOPPED = 'Stopped';
+  PROVIDERSTATUSNONE = 'None';
+  PROVIDERSTATUSINITIALIZING = 'Init';
+  PROVIDERSTATUSRUNNING = 'Running';
+  PROVIDERSTATUSSTOPPING = 'Stopping';
+  PROVIDERSTATUSRESTARTING = 'Restarting';
+  PROVIDERSTATUSDRAINING = 'Draining';
 
 var
   providerHandlers : TDictionary<string, TProviderEventHandler>;
-  eventTypeConversion : TDictionary<string,TLogLevel>;
+  eventTypeConversion : TDictionary<string, TLogLevel>;
+  lsterror : string;
+
+procedure ComposeLastError(const fncname, msg : string);
+begin
+  lsterror := Format('[%s] Exception : %s', [fncname, msg]);
+end;
+
+function TranslateProviderName(const providername : string) : string;
+begin
+  Result := 'TLog' + providername;
+end;
 
 procedure msgdbg(const msg : string);
 begin
@@ -142,51 +172,141 @@ end;
 function GetPChar(const str : string) : PChar;
 begin
   {$IFNDEF  UNIX}
-  Result := CoTaskMemAlloc(SizeOf(Char)*(Length(str)+1));
+    Result := CoTaskMemAlloc(SizeOf(Char)*(Length(str)+1));
   {$ELSE}
-  Result := Memory.MemAlloc(SizeOf(Char)*(Length(str)+1));
+    Result := Memory.MemAlloc(SizeOf(Char)*(Length(str)+1));
   {$ENDIF}
   {$IFNDEF FPC}
     strcopy(Result, PWideChar(str));
   {$ELSE}
-    strcopy(result, pchar(str));
+    strcopy(Result, PChar(str));
   {$ENDIF}
 end;
 
 {$IFNDEF FPC}
 
-function InternalAddProviderFromJSON(const providerType, providerName, ProviderInfo : string) : Integer;
+function FindAnyClass(const Name: string): TClass;
 var
-  provdr : ILogProvider;
-  vjsonobject : TJSONObject;
+  ctx: TRttiContext;
+  typ: TRttiType;
+  list: TArray<TRttiType>;
 begin
-  if providerType = 'fileprovider' then  provdr := TLogFileProvider.Create
-  else if providerType = 'consoleprovider' then provdr := TLogConsoleProvider.Create
-  else if providerType = 'redisprovider' then provdr := TLogRedisProvider.Create
-  else if providerType = 'telegramprovider' then provdr := TLogRedisProvider.Create
-  else if providerType = 'slackprovider' then provdr := TLogTelegramProvider.Create
-  else if providerType = 'restprovider' then provdr := TLogRestProvider.Create
-  else if providerType = 'emailprovider' then provdr := TLogEmailProvider.Create
-  else if providerType = 'adoprovider' then provdr := TLogADODBProvider.Create
-  else if providerType = 'windowseventprovider' then provdr := TLogEventLogProvider.Create
-  else if providerType = 'syslogprovider' then provdr := TLogSysLogProvider.Create;
-  if provdr = nil then Result := Ord(False)
-  else
-  begin
-    Writeln('Quick logger : Added provider! ' + providername + ' - ' + providertype);
-    provdr.FromJson(ProviderInfo);
-    providerHandlers.Add(providername, TProviderEventHandler.Create(providername, provdr));
-    Logger.Providers.Add(provdr);
-    TLogProviderBase(provdr).Enabled := True;
-    Result := Ord(True);
+  Result := nil;
+  ctx := TRttiContext.Create;
+  try
+    list := ctx.GetTypes;
+    for typ in list do
+    begin
+      if typ.IsInstance and Name.EndsWith(typ.Name.ToLower) then
+      begin
+        Result := typ.AsInstance.MetaClassType;
+        Break;
+      end;
+    end;
+  finally
+    ctx.Free;
   end;
 end;
 
-function AddProviderJSONNative(const Provider : string) : Integer; stdcall; export;
+function FindAnyClassToType(const Name: string): TRttiInstanceType;
+var
+  ctx: TRttiContext;
+  typ: TRttiType;
+  list: TArray<TRttiType>;
+begin
+  Result := nil;
+  ctx := TRttiContext.Create;
+  try
+    list := ctx.GetTypes;
+    for typ in list do
+    begin
+      if typ.IsInstance and Name.EndsWith(typ.Name.ToLower) then
+      begin
+        Result := typ.AsInstance;
+        Break;
+      end;
+    end;
+  finally
+    ctx.Free;
+  end;
+end;
+
+function CreateInstance(instanceType : TRttiInstanceType;
+  constructorMethod: TRttiMethod; const arguments: array of TValue): TObject; overload;
+var
+  classType: TClass;
+begin
+  classType := instanceType.MetaclassType;
+  Result := classType.NewInstance;
+  constructorMethod.Invoke(Result, arguments);
+  try
+    Result.AfterConstruction;
+  except
+    on Exception do
+    begin
+      Result.Free;
+      raise;
+    end;
+  end;
+end;
+
+function CreateInstance(const classTypeName : string; const arguments: array of TValue; out classType : TClass) : TObject; overload;
+var
+  ctx : TRttiContext;
+  typ : TRttiType;
+  list : TArray<TRttiType>;
+  instance : TRttiInstanceType;
+begin
+  Result := nil;
+  ctx := TRttiContext.Create;
+  try
+    list := ctx.GetTypes;
+    for typ in list do
+    begin
+      if typ.IsInstance and classTypeName.EndsWith(typ.Name.ToLower) then
+      begin
+        instance := typ.AsInstance;
+        classtype := typ.AsInstance.MetaClassType;
+        Result := CreateInstance(instance, ctx.GetType(classtype).GetMethod('Create'), arguments);
+        Break;
+      end;
+    end;
+  finally
+    ctx.Free;
+  end;
+
+end;
+
+function InternalAddProviderFromJSON(const providerType, providerName, ProviderInfo : string) : Integer;
+var
+  rtticontext : TRttiContext;
+  providerclass : TClass;
+  provider : TObject;
+begin
+  try
+    if providerHandlers.ContainsKey(providerName) then raise Exception.Create(Format('A provider with the same name %s is already added, change name an try again.', [providerName]));
+    provider := CreateInstance(TranslateProviderName(providerType).ToLower, [], providerclass);
+    if provider = nil then raise Exception.Create('Provider ' + providerType + ' Not found in Quicklogger included native libary.');
+    begin
+      rtticontext.GetType(providerclass).GetMethod('FromJSON').Invoke(provider, [ProviderInfo]);
+      TLogProviderBase(provider).Name := providerName;
+      Logger.Providers.Add(TLogProviderBase(provider));
+      providerHandlers.Add(providername, TProviderEventHandler.Create(providerName, TLogProviderBase(provider)));
+      TLogProviderBase(provider).Enabled := True;
+      Result := Ord(True);
+    end;
+  except
+    on e : Exception do
+    begin
+      ComposeLastError('InternalAddProviderFromJSON ' + providerName , e.Message);
+      Result := Ord(False);
+    end;
+  end;
+end;
+
+function AddProviderJSONNative(Provider : Pchar) : Integer; stdcall; export;
 var
   vJSONScenario: TJSONValue;
-  vJSONValue: TJSONValue;
-  vJSONLevel : TJSONString;
   vJSONObject : TJSONObject;
   vProviderInfo : TJSONObject;
   realLogLevel : TLogLevel;
@@ -215,10 +335,14 @@ begin
         end;
       end;
     except
-      on e : Exception do Writeln(e.Message);
+      on e : Exception do
+      begin
+        ComposeLastError('AddProviderJSONNative', e.Message);
+        Result := Ord(False);
+      end;
     end;
   finally
-    vJSONScenario.Free;
+    if vJSONScenario <> nil then vJSONScenario.Free;
   end;
 end;
 
@@ -228,34 +352,63 @@ function InternalAddProviderFromJSON(const providerType, providerName, ProviderI
 var
   provdr : TLogProviderBase;
 begin
-  if providerType = 'FileProvider' then
-  begin
-    provdr := TLogFileProvider.Create;
-    providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
-  end
-  else if providerType = 'RedisProvider' then
-  begin
-    provdr := TLogRedisProvider.Create;
-    providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
-  end
-  else if providerType = 'TelegramProvider' then
-  begin
-    provdr := TLogTelegramProvider.Create;
-    providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
-  end
-  else if providerType = 'SlackProvider' then
-  begin
-    provdr := TLogSlackProvider.Create;
-    providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
-  end
-  else if providerType = 'RestProvider' then
-  begin
-    provdr := TLogRestProvider.Create;
-    providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+  try
+    if providerHandlers.ContainsKey(providerName) then raise Exception.Create(Format('A provider with the same name %s is already added, change name an try again.', [providerName]));
+    if providerType = 'FileProvider' then
+    begin
+      provdr := TLogFileProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'RedisProvider' then
+    begin
+      provdr := TLogRedisProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'TelegramProvider' then
+    begin
+      provdr := TLogTelegramProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'SlackProvider' then
+    begin
+      provdr := TLogSlackProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'RestProvider' then
+    begin
+      provdr := TLogRestProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'SysLogProvider' then
+    begin
+      provdr := TLogSysLogProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'InfluxDBProvider' then
+    begin
+      provdr := TLogInfluxDBProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+    else if providerType = 'ElasticSearchProvider' then
+    begin
+      provdr := TLogElasticSearchProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+      else if providerType = 'GraylogProvider' then
+    begin
+      provdr := TLogElasticSearchProvider.Create;
+      providerHandlers.Add(Providername, TProviderEventHandler.Create(providerName, provdr));
+    end
+  except
+    on e : Exception do
+    begin
+      ComposeLastError('AddProviderJSONNative', e.Message);
+      Result := Ord(False);
+    end;
   end;
 end;
 
-function AddProviderJSONNative(const Provider : string) : Integer; stdcall; export;
+function AddProviderJSONNative(const Provider : PChar) : Integer; stdcall; export;
 var
   vJSONScenario: TJSONData;
   vJSONObject : TJSONObject;
@@ -263,7 +416,6 @@ var
   providerinfo : string;
   providertype : string;
 begin
-  Writeln('Add provider from JSON is not implemented on linux yet... use Default Console and File Providers.');
   Result := 0;
   Exit;
   //TODO Implement Add providers from JSON and Linux
@@ -285,7 +437,6 @@ begin
             providername := string(vJSONObject.Get('providerName')).Replace('"','');
             providerinfo := string(vJSONObject.Get('providerInfo')).Replace('"','');
             providertype := string(vJSONObject.Get('providerType')).Replace('"','');
-            writeln('Adding provider ' + providername);
             InternalAddProviderFromJSON(providertype, providername, providerinfo);
             Result := Ord(True);
           end;
@@ -299,7 +450,7 @@ end;
 
 {$ENDIF}
 
-function RemoveProviderNative(const Provider : string) : Integer; stdcall; export;
+function RemoveProviderNative(const Provider : PChar) : Integer; stdcall; export;
 var
   providerHandler : TProviderEventHandler;
 begin
@@ -308,7 +459,7 @@ begin
   begin
     providerHandler.fprovider.Stop;
     Logger.Providers.Remove(providerHandler.fprovider);
-    providerHandler.Free;
+    providerHandlers.Remove(Provider);
     Result := Ord(true);
   end;
 end;
@@ -327,7 +478,7 @@ begin
   Result := Ord(True);
 end;
 
-function AddStandardFileProviderNative(const LogFilename : string) : Integer; stdcall; export;
+function AddStandardFileProviderNative(const LogFilename : PChar) : Integer; stdcall; export;
 begin
   with GlobalLogFileProvider do
   begin
@@ -339,47 +490,47 @@ begin
   Result := Ord(True);
 end;
 
-procedure ResetProviderNative(const ProviderName : string); stdcall; export;
+procedure ResetProviderNative(ProviderName : PChar); stdcall; export;
 begin
-  Writeln('ResetProvider is not implemented yet.');
+  //Writeln('ResetProvider is not implemented yet.');
 end;
 
-procedure InfoNative(const Line : string); stdcall; export;
+procedure InfoNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.TEventType.etInfo);
 end;
 
-procedure WarningNative(const Line : string); stdcall; export;
+procedure WarningNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.TEventType.etWarning);
 end;
 
-procedure ErrorNative(const Line : string); stdcall; export;
+procedure ErrorNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.TEventType.etError);
 end;
 
-procedure CriticalNative(const Line : string); stdcall; export;
+procedure CriticalNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.TEventType.etCritical);
 end;
 
-procedure TraceNative(const Line : string); stdcall; export;
+procedure TraceNative(Line : PChar); stdcall; export;
 begin
-  Logger.Add(Line, Quick.Logger.TEventType.etCritical);
+  Logger.Add(Line, Quick.Logger.TEventType.etTrace);
 end;
 
-procedure CustomNative(const Line : string); stdcall; export;
+procedure CustomNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.TEventType.etCustom1);
 end;
 
-procedure SuccessNative(const Line : string); stdcall; export;
+procedure SuccessNative(Line : PChar); stdcall; export;
 begin
   Logger.Add(Line, Quick.Logger.etSuccess);
 end;
 
-procedure AddWrapperErrorDelegateNative(const ProviderName : string; Callback : TWrapperError); stdcall; export;
+procedure AddWrapperErrorDelegateNative(const ProviderName : PChar; Callback : TWrapperError); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -389,7 +540,7 @@ begin
   end;
 end;
 
-procedure AddWrapperFailDelegateNative(const ProviderName : string; Callback : TWrapperFailToLog); stdcall; export;
+procedure AddWrapperFailDelegateNative(const ProviderName : PChar; Callback : TWrapperFailToLog); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -399,20 +550,17 @@ begin
   end;
 end;
 
-procedure AddWrapperStartDelegateNative(const ProviderName : string; Callback : TWrapperStart); stdcall; export;
+procedure AddWrapperStartDelegateNative(const ProviderName : PChar; Callback : TWrapperStart); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
-  Writeln('AddWrapperStart delegate native called ' + ProviderName);
   if providerHandlers.TryGetValue(providername, providerHandler) then
   begin
-    Writeln('Provider handler is assigned and is ' + providerhandler.fproviderfriendlyname);
-    if not Assigned(Callback) then Writeln('But passed callback pointer is nil');
     providerhandler.WrapperStart := Callback;
   end;
 end;
 
-procedure AddWrapperRestartDelegateNative(const ProviderName : string; Callback : TWrapperRestart); stdcall; export;
+procedure AddWrapperRestartDelegateNative(const ProviderName : PChar; Callback : TWrapperRestart); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -422,7 +570,7 @@ begin
   end;
 end;
 
-procedure AddWrapperQueueErrorDelegateNative(const ProviderName : string; Callback : TWrapperQueueError); stdcall; export;
+procedure AddWrapperQueueErrorDelegateNative(const ProviderName : PChar; Callback : TWrapperQueueError); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -432,7 +580,7 @@ begin
   end;
 end;
 
-procedure AddWrapperCriticalErrorDelegateNative(const ProviderName : string; Callback : TWrapperCriticalError); stdcall; export;
+procedure AddWrapperCriticalErrorDelegateNative(const ProviderName : PChar; Callback : TWrapperCriticalError); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -442,7 +590,7 @@ begin
   end;
 end;
 
-procedure AddWrapperSendLimitsDelegateNative(const ProviderName : string; Callback : TWrapperSendLimits); stdcall; export;
+procedure AddWrapperSendLimitsDelegateNative(const ProviderName : PChar; Callback : TWrapperSendLimits); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -452,7 +600,7 @@ begin
   end;
 end;
 
-procedure AddWrapperStatusChangedDelegateNative(const ProviderName : string; Callback : TWrapperStatusChanged); stdcall; export;
+procedure AddWrapperStatusChangedDelegateNative(const ProviderName : PChar; Callback : TWrapperStatusChanged); stdcall; export;
 var
   providerhandler : TProviderEventHandler;
 begin
@@ -466,17 +614,14 @@ procedure TestCallbacksNative; stdcall; export;
 var
   prov : TProviderEventHandler;
 begin
-  Writeln('TestCallBacksNativeCalled');
   for prov in providerHandlers.Values do
   begin
-    Writeln('Providername ' + prov.fproviderfriendlyname);
     prov.TestCallbacks;
   end;
 end;
 
 function GetProviderNamesNative(out str: PChar): Integer; stdcall; export;
 var
-  vJSONScenario : TJSONArray;
   providername : string;
 begin
   try
@@ -495,19 +640,34 @@ begin
       end;
     end;
   except
-    on e : Exception do Writeln(e.Message);
+    on e : Exception do
+    begin
+      ComposeLastError('GetProviderNamesNative', e.Message);
+      Result := Ord(False);
+    end;
   end;
 end;
 
-function GetLibVersionNative(out str: PChar): Integer; stdcall;
+procedure ExceptionNative(const Line, Excp : PChar); stdcall; export;
 begin
-  str := GetPChar('QuickLogger 1.29');
+  Logger.Add(Line, Excp, etException);
+end;
+
+function GetLastError(out str: PChar): Integer; stdcall; export;
+begin
+  str := GetPChar(lsterror);
+  Result := 1;
+end;
+
+function GetLibVersionNative(out str: PChar): Integer; stdcall; export;
+begin
+  str := GetPChar(Format('QuickLogger %s', [QLVERSION]));
   Result := 1;
 end;
 
 { TProviderEventHandler }
 
-constructor TProviderEventHandler.Create(const FriendlyName : string; Provider: ILogProvider);
+constructor TProviderEventHandler.Create(const FriendlyName : string; Provider: TLogProviderBase);
 begin
   fprovider := provider;
   fproviderfriendlyname := FriendlyName;
@@ -538,24 +698,19 @@ begin
   TLogProviderBase(fprovider).OnStatusChanged := procedure(providername : string; status : TLogProviderStatus)
   begin
     case status of
-      psNone : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('None'));
-      psStopped : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Stopped'));
-      psInitializing : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Init'));
-      psRunning : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Running'));
-      psDraining : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Draining'));
-      psStopping : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Stopping'));
-      psRestarting : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar('Restarting'));
+      psNone : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSNONE));
+      psStopped : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSTOPPED));
+      psInitializing : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSINITIALIZING));
+      psRunning : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSRUNNING));
+      psDraining : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSDRAINING));
+      psStopping : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSSTOPPING));
+      psRestarting : if Assigned(fwraperstatuschanged) then fwraperstatuschanged(PChar(PROVIDERSTATUSRESTARTING));
     end;
   end
   {$ENDIF}
 end;
 
 {$IFDEF FPC}
-
-procedure TProviderEventHandler.TestCallbacks;
-begin
-  //
-end;
 
 procedure TProviderEventHandler.ToWrapperError(const msg: string);
 begin
@@ -606,8 +761,20 @@ begin
   end;
 end;
 
+{$ENDIF}
 
-{$ELSE}
+destructor TProviderEventHandler.Destroy;
+begin
+  if Assigned(fwrapperstart) then fwrapperstart := nil;
+  if Assigned(fwraperstatuschanged) then fwraperstatuschanged := nil;
+  if Assigned(fwrappersendlimits) then fwrappersendlimits := nil;
+  if Assigned(fwrapperrestart) then fwrapperrestart := nil;
+  if Assigned(fwrapperqueueerror) then fwrapperqueueerror := nil;
+  if Assigned(fwrapperfailtolog) then fwrapperfailtolog := nil;
+  if Assigned(fwrappererror) then fwrappererror := nil;
+  if Assigned(fwrappercriticalerror) then fwrappercriticalerror := nil;
+  inherited;
+end;
 
 procedure TProviderEventHandler.TestCallbacks;
 begin
@@ -621,7 +788,66 @@ begin
   if Assigned(fwrappercriticalerror) then fwrappercriticalerror(PChar(fproviderfriendlyname + ' Native on critical error callback called'));
 end;
 
-{$ENDIF}
+procedure EnableProviderNative(const ProviderName : PChar); stdcall; export;
+var
+  provider : ILogProvider;
+begin
+  for provider in Logger.Providers do
+  begin
+    if provider.GetName = ProviderName then
+    begin
+      TLogProviderBase(provider).Enabled := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure DisableProviderNative(const ProviderName : PChar); stdcall; export;
+var
+  provider : ILogProvider;
+begin
+  for provider in Logger.Providers do
+  begin
+    if provider.GetName = ProviderName then
+    begin
+      TLogProviderBase(provider).Enabled := False;
+      Exit;
+    end;
+  end;
+end;
+
+procedure WaitSecondsForFlushBeforeExitNative(Seconds : Integer); stdcall; export;
+begin
+  Logger.WaitForFlushBeforeExit := Seconds;
+end;
+
+function GetQueueCountNative(out value : Integer) : Integer; stdcall; export;
+begin
+  value := Logger.QueueCount;
+  Result := 1;
+end;
+
+function GetProvidersQueueCountNative(out value : Integer) : Integer; stdcall; export;
+begin
+  value := Logger.ProvidersQueueCount;
+  Result := 1;
+end;
+
+function GetCurrentProvidersNative(out value : PChar) : Integer; stdcall; export;
+begin
+  {$IFNDEF FPC}
+  value := GetPChar(Logger.Providers.ToJson);
+  {$ELSE}
+  value := GetPChar('');
+  {$ENDIF}
+  Result := 1;
+end;
+
+function IsQueueEmptyNative(out value : Boolean) : Integer; stdcall; export;
+begin
+  value := Logger.IsQueueEmpty;
+  Result := 1;
+end;
 
 exports
   AddProviderJSONNative,
@@ -630,6 +856,7 @@ exports
   WarningNative,
   ErrorNative,
   CriticalNative,
+  ExceptionNative,
   TraceNative,
   CustomNative,
   SuccessNative,
@@ -643,11 +870,18 @@ exports
   AddWrapperCriticalErrorDelegateNative,
   AddWrapperSendLimitsDelegateNative,
   AddWrapperStatusChangedDelegateNative,
+  WaitSecondsForFlushBeforeExitNative,
+  GetQueueCountNative,
+  GetProvidersQueueCountNative,
+  IsQueueEmptyNative,
   ResetProviderNative,
+  GetCurrentProvidersNative,
   GetProviderNamesNative,
+  EnableProviderNative,
+  DisableProviderNative,
   TestCallbacksNative,
+  GetLastError,
   GetLibVersionNative;
-
 
 begin
   providerHandlers := TDictionary<string,TProviderEventHandler>.Create;

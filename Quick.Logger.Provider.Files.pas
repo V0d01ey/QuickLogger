@@ -1,13 +1,13 @@
 ﻿{ ***************************************************************************
 
-  Copyright (c) 2016-2018 Kike Pérez
+  Copyright (c) 2016-2019 Kike Pérez
 
   Unit        : Quick.Logger.Provider.Files
   Description : Log Console Provider
   Author      : Kike Pérez
-  Version     : 1.23
+  Version     : 1.27
   Created     : 12/10/2017
-  Modified    : 08/09/2018
+  Modified    : 25/03/2019
 
   This file is part of QuickLogger: https://github.com/exilon/QuickLogger
 
@@ -68,10 +68,11 @@ type
     procedure CompressLogFile(const cFileName : string);
     function GetLogFileBackup(cNumBackup : Integer; zipped : Boolean) : string;
     function CheckNeedRotate : Boolean;
+    procedure SetFileName(const Value: string);
   public
     constructor Create; override;
     destructor Destroy; override;
-    property FileName : string read fFileName write fFileName;
+    property FileName : string read fFileName write SetFileName;
     {$IFDEF MSWINDOWS}
     property AutoFileNameByProcess : Boolean read fAutoFileName write fAutoFileName;
     {$ENDIF}
@@ -102,11 +103,7 @@ implementation
 constructor TLogFileProvider.Create;
 begin
   inherited;
-  {$IFNDEF ANDROID}
-  fFileName := TPath.GetDirectoryName(ParamStr(0)) + PathDelim + TPath.GetFileNameWithoutExtension(ParamStr(0)) + '.log';
-  {$ELSE}
-  fFileName := TPath.GetDocumentsPath + PathDelim + 'logger.log';
-  {$ENDIF}
+  fFileName := '';
   fIsRotating := False;
   fMaxRotateFiles := 5;
   fMaxFileSizeInMB := 20;
@@ -125,6 +122,7 @@ end;
 destructor TLogFileProvider.Destroy;
 begin
   if Assigned(fLogWriter) then fLogWriter.Free;
+  fLogWriter := nil;
   inherited;
 end;
 
@@ -147,6 +145,17 @@ var
   FileMode : Word;
   fs : TFileStream;
 begin
+  if Assigned(fLogWriter) then fLogWriter.Free;
+  fLogWriter := nil;
+  if fFileName = '' then
+  begin
+    {$IFNDEF ANDROID}
+    fFileName := TPath.GetDirectoryName(ParamStr(0)) + PathDelim + TPath.GetFileNameWithoutExtension(ParamStr(0)) + '.log';
+    {$ELSE}
+    fFileName := TPath.GetDocumentsPath + PathDelim + 'logger.log';
+    {$ENDIF}
+  end;
+
   if fFileName.StartsWith('.'+PathDelim) then fFileName := StringReplace(fFileName,'.'+PathDelim,TPath.GetDirectoryName(ParamStr(0)) + PathDelim,[])
     else if ExtractFilePath(fFileName) = '' then fFileName := TPath.GetDirectoryName(ParamStr(0)) + PathDelim + fFileName;
 
@@ -197,10 +206,10 @@ begin
       WriteToStream(Format('Path        : %s',[SystemInfo.AppPath]));
       WriteToStream(Format('CPU cores   : %d',[SystemInfo.CPUCores]));
       if iiOSVersion in IncludedInfo then WriteToStream(Format('OS version  : %s',[SystemInfo.OSVersion]));
-      {$IFDEF MSWINDOWS}
+      //{$IFDEF MSWINDOWS}
       if iiHost in IncludedInfo then WriteToStream(Format('Host        : %s',[SystemInfo.HostName]));
       if iiUserName in IncludedInfo then WriteToStream(Format('Username    : %s',[SystemInfo.UserName]));
-      {$ENDIF}
+      //{$ENDIF}
       WriteToStream(Format('Started     : %s',[DateTimeToStr(Now(),FormatSettings)]));
       {$IFDEF MSWINDOWS}
       if IsService then WriteToStream('AppType     : Service')
@@ -276,7 +285,7 @@ end;
 procedure TLogFileProvider.Restart;
 begin
   Stop;
-  if Assigned(fLogWriter) then fLogWriter.Free;
+  //if Assigned(fLogWriter) then fLogWriter.Free;
   Init;
 end;
 
@@ -289,7 +298,11 @@ begin
   fIsRotating := True;
   try
     //frees stream file
-    if Assigned(fLogWriter) then fLogWriter.Free;
+    if Assigned(fLogWriter) then
+    begin
+      fLogWriter.Free;
+      fLogWriter := nil;
+    end;
     try
       //delete older log backup and zip
       RotateFile := GetLogFileBackup(fMaxRotateFiles,True);
@@ -326,6 +339,15 @@ begin
                                   end
                                   ).Start;
     {$ENDIF}
+  end;
+end;
+
+procedure TLogFileProvider.SetFileName(const Value: string);
+begin
+  if Value <> fFileName then
+  begin
+    fFileName := Value;
+    if IsEnabled then Restart;
   end;
 end;
 
